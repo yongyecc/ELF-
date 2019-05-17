@@ -4,6 +4,10 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/wait.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
 
 
 #define PTRACE_ERR_NONE			0	/* No error */
@@ -12,11 +16,7 @@
 #define PTRACE_ERR_ALTSTACK_ORIG	3	/* Original stack error */
 #define PTRACE_ERR_ALTSTACK_INUSE	4	/* Stack currently in use */
 
-/* libtrace error flags
- *  *
- *   * PTRACE_ERR_FLAG_REMOTE	Specifies an error occured in the remote process.
- *    * PTRACE_ERR_FLAG_EXTERNAL	Specifies the error is not an libptrace internal error.
- *     */
+
 #define PTRACE_ERR_FLAG_NONE		0
 #define PTRACE_ERR_FLAG_REMOTE		1
 #define PTRACE_ERR_FLAG_EXTERNAL	2
@@ -84,4 +84,3 @@ struct ptrace_context
 	struct ptrace_error error;
 	struct ptrace_altstack stack;
 };
-
