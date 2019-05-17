@@ -2,8 +2,40 @@
 #include <elf.h>
 #include "rebuild.h"
 #include <alloca.h>
+#include <stdlib.h>
 #include <assert.h>
 
+
+char shstrtable[] =
+"\0"
+".interp\0"
+".hash\0"
+".note.ABI-tag\0"
+".gnu.hash\0"
+".dynsym\0"
+".dynstr\0"
+".gnu.version\0"
+".gnu.version_r\0"
+".rel.dyn\0"
+".rel.plt\0"  
+".init\0"
+".plt\0"
+".text\0"
+".fini\0"
+".rodata\0"
+".eh_frame_hdr\0"
+".eh_frame\0"
+".ctors\0"
+".dtors\0"
+".jcr\0"
+".dynamic\0"
+".got\0"
+".got.plt\0"
+".data\0"
+".bss\0"
+".shstrtab\0"
+".symtab\0"
+".strtab\0";
 
 void main(int argc, char* argv[]){
 
@@ -30,6 +62,7 @@ int PDump2ELF(int pid, char *name)
 	Elf32_Phdr *phdr;
 	Elf32_Dyn *dyn;
 	struct pt_load pt_load;
+	char *p1;
 	Elf32_Shdr shdr;
 	uint32_t totlen;
 	Elf32_Sym  *symtab;
@@ -41,6 +74,7 @@ int PDump2ELF(int pid, char *name)
 	uint32_t dynsize, interp_size;
 	int TS, DS, i, j, fd, bss_len = 0, found_loadables = 0;
 	static int syscall_trap = SIGTRAP;
+	uint8_t null = 0;
 
 	p = &ptc;
 	if(ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1){
@@ -166,6 +200,7 @@ if ( ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD) == 0 )
 			
 			/*.bss 段长度*/
 			bss_len = phdr[i + 1].p_memsz - phdr[i + 1].p_filesz;
+			printf("[+] bss segment size is : %d\n", bss_len);
 	/* 准备将代码段和数据段写入pmem这个申请的空间中*/
 			TS = i;
 			DS = i + 1;
@@ -227,14 +262,15 @@ if ( ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD) == 0 )
 				printf("Located PLT GOT Vaddr 0x%x\n", got = (Elf32_Addr)dyn[i].d_un.d_ptr);
 				printf("Relevant GOT entries begin at 0x%x\n", (Elf32_Addr)dyn[i].d_un.d_ptr + 12);
 				
-				/* got[0] link_map */
+				/* GOT表相对data段的偏移地址 */
 				got_off = dyn[i].d_un.d_ptr - pt_load.data_vaddr;
-				
+				/*GOT[0]*/
 				GLOBAL_OFFSET_TABLE = (Elf32_Addr *)(pmem + pt_load.data_offset + got_off);
 				/* GLOBAL_OFFSET_TABLE[0] -> link_map (DYNAMIC segment)
  *  				  GLOBAL_OFFSET_TABLE[1] -> /lib/ld-2.6.1.so (Runtime linker)
  *  				  GLOBAL_OFFSET_TABLE[2] -> /lib/ld-2.6.1.so (Runtime linker)
  *  				  Lets increment the GOT to __gmon_start__ (Our base PLT entry) */
+				/* 从GOT[3] 开始是共享函数的条目*/
 				GLOBAL_OFFSET_TABLE += 3;
 				break;
 			case DT_PLTRELSZ:
@@ -245,11 +281,238 @@ if ( ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD) == 0 )
 				break;
 			case DT_SYMTAB:
 				symtab = (Elf32_Sym *)dyn[i].d_un.d_ptr;
-				break;	
-			
+				break;		
 		}
 	}
+	if (!dyn)
+		goto no_dynamic;
+	uint8_t *gp = &pmem[pt_load.data_offset + got_off + 4];
+	for (i = 0; i < 8; i++)
+		*(gp + i) = 0x0;
+	Elf32_Addr PLT_VADDR = GLOBAL_OFFSET_TABLE[0];/* gmon_start */
+	/*
+ 	  08048300 <__gmon_start__@plt>:
+  	  8048300:       ff 25 00 a0 04 08       jmp    *0x804a000
+  	  8048306:       68 00 00 00 00          push   $0x0  <- Here is where PLT_VADDR is  
+ 	  804830b:       e9 e0 ff ff ff          jmp    80482f0 <_init+0x18>
+ 	 */
+	printf("[+] Resolved PLT: 0x%x\n", PLT_VADDR);
+	printf("PLT Entries: %d\n", plt_siz);
+	PLT_VADDR += 16;
+	for (j = 1; j < plt_siz; j++)
+	{
+		printf("Patch #%d - [0x%x] changed to [0x%x]\n", j, GLOBAL_OFFSET_TABLE[j], PLT_VADDR);
+		GLOBAL_OFFSET_TABLE[j] = PLT_VADDR;
+		PLT_VADDR += 16;
+	}	
+	
+	printf("[+] Patched GOT with PLT stubs\n");	
+	no_dynamic:
+	if ((fd = open(name, O_TRUNC|O_WRONLY|O_CREAT)) == -1)
+	{
+		printf("Unable to open file for writing: %s\n", strerror(errno));
+		return -1;
+	}
+	
+	if (fchmod(fd, 00777) < 0)
+		printf("Warning: Unable to set permissions on output file\n");
+	
+	ep->e_shstrndx = !dyn ? 4 : 6;
+	ep->e_shoff = totlen + bss_len + sizeof(shstrtable);
+	ep->e_shnum = !dyn ? 5 : 7;
+	Elf32_Off shsoff = totlen + bss_len;
+	//将text段、data段写入文件
+	if (write(fd, pmem, totlen) != totlen)
+	{
+		printf("Unable to write entire data: %s\n", strerror(errno));
+		return -1;
+	}
+	//写入bss段
+	int bw;
+	if ((bw = write(fd, &null, bss_len)) == -1) //bss_len)
+	{
+		printf("Unable to create bss padding %d bytes (but only %d written): %s\n", bss_len, bw, strerror(errno));
+		return -1;
+	}
 
+	totlen += bss_len;
+	/* Write string table (final section) */
+	if (write(fd, (char *)shstrtable, sizeof(shstrtable)) != sizeof(shstrtable))
+	{
+		printf("Unable to write string table %d bytes: %s\n", strerror(errno));
+		return -1;
+	}
+	int slen = sizeof(Elf32_Shdr);
+	/* Add NULL section */
+	memset(&shdr, 0, slen);	
+	shdr.sh_addr = BaseVaddr;
+	
+	if (write(fd, &shdr, slen) != slen)
+        {
+                printf("Error in writing section header: %s\n", strerror(errno));
+                return -1;
+        }
+
+        totlen += slen;
+	
+	if (!dyn)
+		goto no_interp;
+	/* Add .interp section */
+	shdr.sh_type = SHT_PROGBITS;
+	shdr.sh_offset = interp_off;
+	shdr.sh_addr = interp_vaddr;
+	shdr.sh_flags = SHF_ALLOC;
+	shdr.sh_link = 0;
+	shdr.sh_info = 0;
+	shdr.sh_entsize = 0;
+	shdr.sh_size = interp_size;
+	shdr.sh_addralign = 0;
+	
+	for (i = 0, p1 = shstrtable ;; i++)
+                if (p1[i] == '.' && p1[i + 1] == 'i' && p1[i + 2] == 'n' && p1[i + 3] == 't' && p1[i + 4] == 'e')
+                {
+                        shdr.sh_name = i;
+                        break;
+                }
+
+	if (write(fd, &shdr, slen) != slen)
+        {
+                printf("Error in writing section header: %s\n", strerror(errno));
+                return -1;
+        }
+        totlen += slen;
+	no_interp:
+	/* Add .text section */
+	shdr.sh_type = SHT_PROGBITS;
+	shdr.sh_offset = phdr[TS].p_offset;
+	shdr.sh_addr = phdr[TS].p_vaddr;
+	shdr.sh_flags = SHF_ALLOC | SHF_EXECINSTR;
+	shdr.sh_info = 0;
+	shdr.sh_link = 0;
+	shdr.sh_entsize = 0;
+	shdr.sh_size = phdr[TS].p_filesz;
+	shdr.sh_addralign = 0xf;
+
+	for (i = 0, p1 = shstrtable ;; i++)
+		if (p1[i] == '.' && p1[i + 1] == 't' && p1[i + 2] == 'e' && p1[i + 3] == 'x' && p1[i + 4] == 't')
+		{
+			shdr.sh_name = i;
+			break;
+		}
+	if (write(fd, &shdr, slen) != slen)
+	{
+		printf("Error in writing section header: %s\n", strerror(errno));
+		return -1;
+	}
+	
+	totlen += slen;
+
+	/* Add .data section */
+	shdr.sh_type = SHT_PROGBITS;
+        shdr.sh_offset = phdr[DS].p_offset;
+        shdr.sh_addr = phdr[DS].p_vaddr;
+        shdr.sh_flags = SHF_ALLOC | SHF_WRITE;
+        shdr.sh_info = 0;
+        shdr.sh_link = 0;
+        shdr.sh_entsize = 0;
+	shdr.sh_size = phdr[DS].p_filesz;
+	shdr.sh_addralign = 4;
+
+	for (i = 0, p1 = shstrtable ;; i++)
+                if (p1[i] == '.' && p1[i + 1] == 'd' && p1[i + 2] == 'a' && p1[i + 3] == 't' && p1[i + 4] == 'a')
+                {
+		        shdr.sh_name = i;
+			break;
+		}
+	
+	if (write(fd, &shdr, slen) != slen)
+        {
+                printf("Error in writing section header: %s\n", strerror(errno));
+                return -1;
+        }
+
+	totlen += slen;
+	if (!dyn)
+		goto no_dynam_section;
+
+	/* Add .dynamic section */
+	shdr.sh_type = SHT_DYNAMIC;
+        shdr.sh_offset = dynoffset;
+        shdr.sh_addr = dynvaddr;
+        shdr.sh_flags = SHF_WRITE | SHF_ALLOC;
+        shdr.sh_info = 0;
+        shdr.sh_link = 0;
+        shdr.sh_entsize = 8;
+        shdr.sh_size = dynsize;
+	shdr.sh_addralign = 4;
+
+	for (i = 0, p1 = shstrtable ;; i++)
+                if (p1[i] == '.' && p1[i + 1] == 'd' && p1[i + 2] == 'y' && p1[i + 3] == 'n' && p1[i + 4] == 'a' 
+		 		&& p1[i + 5] == 'm' && p1[i + 6] == 'i' && p1[i + 7] == 'c')
+                {
+		        shdr.sh_name = i;
+			break;
+		}
+
+	if (write(fd, &shdr, slen) != slen)
+        {
+                printf("Error in writing section header: %s\n", strerror(errno));
+                return -1;
+        }
+        totlen += slen;
+	
+	no_dynam_section:
+
+	/* Add .bss section */
+	shdr.sh_type = SHT_NOBITS;
+        shdr.sh_offset = phdr[DS].p_offset + phdr[DS].p_filesz;
+        shdr.sh_addr = phdr[DS].p_vaddr + phdr[DS].p_filesz;
+        shdr.sh_flags = SHF_WRITE | SHF_ALLOC;
+        shdr.sh_info = 0;
+        shdr.sh_link = 0;
+        shdr.sh_entsize = 0;
+        shdr.sh_size = bss_len;
+	shdr.sh_addralign = 4;
+
+        for (i = 0, p1 = shstrtable ;; i++)
+                if (p1[i] == '.' && p1[i + 1] == 'b' && p1[i + 2] == 's' && p1[i + 3] == 's')
+                {
+                        shdr.sh_name = i;
+                        break;
+                }
+
+        if (write(fd, &shdr, slen) != slen)
+        {
+                printf("Error in writing section header: %s\n", strerror(errno));
+                return -1;
+        }
+        totlen += slen;
+	/* add .shstrtab */
+	shdr.sh_type = SHT_STRTAB;
+	shdr.sh_offset = shsoff;
+	shdr.sh_addr = BaseVaddr + shsoff;
+	shdr.sh_flags = 0;
+	shdr.sh_info = 0;
+	shdr.sh_link = 0;
+	shdr.sh_entsize = 0;
+	shdr.sh_size = sizeof(shstrtable);
+	shdr.sh_addralign = 1;
+
+	for (i = 0, p1 = shstrtable ;; i++)
+                if (p1[i] == '.' && p1[i + 1] == 's' && p1[i + 2] == 'h' && p1[i + 3] == 's' && p1[i + 4] == 't')
+                {
+                        shdr.sh_name = i;
+                        break;
+                }
+
+	if (write(fd, &shdr, slen) != slen)
+        {
+                printf("Error in writing section header: %s\n", strerror(errno));
+                return -1;
+        }
+        totlen += slen;
+	ptrace_close(&ptc);
+	close(fd);
 	return 0;
 
 out_detach:
@@ -309,4 +572,25 @@ int ptrace_read(struct ptrace_context *p, void *dest, const void *src, size_t le
 out_error:
 	PTRACE_ERR_SET_EXTERNAL(p);
 	return -1;
+}
+
+
+int ptrace_close(struct ptrace_context *p)
+{
+	return ptrace_detach(p);
+}
+
+int ptrace_detach(struct ptrace_context *p)
+{
+	if ( ptrace(PTRACE_DETACH, p->tid, NULL, NULL) == -1 ) {
+		PTRACE_ERR_SET_EXTERNAL(p);
+		return -1;
+	}
+
+	if (p->error.errmsg != NULL)
+		free(p->error.errmsg);
+
+	PTRACE_ERR_CLEAR(p);
+
+	return 0;
 }
