@@ -512,6 +512,8 @@ if ( ptrace(PTRACE_SETOPTIONS, pid, NULL, PTRACE_O_TRACESYSGOOD) == 0 )
         }
         totlen += slen;
 	ptrace_close(&ptc);
+	printf("Successfully rebuilt ELF object from memory\n");
+	printf("Output executable location: %s\n", name);
 	close(fd);
 	return 0;
 
